@@ -1,0 +1,5 @@
+# Ignore everything inside data/
+data/*
+
+# But keep the folder itself (you can create a .gitkeep file)
+!data/.gitkeep
