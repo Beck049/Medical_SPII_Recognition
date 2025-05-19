@@ -10,26 +10,26 @@ Medical_SPII_Recognition/
     |     ├─ config_ASR.yaml  # 放 model 路徑、參數設定
     |     └─ config_NER.yaml  # 放 model 路徑、參數設定
     |
-    ├- data/
-    |    ├- TRAINING_DATASET_1_PHASE/
-    |    |          ├- Training_Dataset_01/
-    |    |          |        ├─ audio/
-    |    |          |        |     └── xxx.wav
-    |    |          |        ├- task1_answer.txt
-    |    |          |        └─ task2_answer.txt
-    |    |          └──Validation_Dataset/
-    |    |                   └─ audio/
-    |    |                         └── xxx.wav
-    |    └─ TRAINING_DATASET_2_PHASE/
-    |
+    ├- data/   # data 不要上傳到 github
+    |    └- TRAINING_DATASET_1_PHASE/
+    |               ├- Training_Dataset_01/
+    |               |        ├─ audio/
+    |               |        |     └── xxx.wav
+    |               |        ├- task1_answer.txt
+    |               |        └─ task2_answer.txt
+    |               ├- Training_Dataset_02/
+    |               └──Validation_Dataset/
+    |                        └─ audio/
+    |                             └── xxx.wav
     ├- models/
+    |     └── whisper_finetuned/
     |
     ├- outputs/
+    |     └── ASR/
     |
-    ├- utils/
+    ├- utils/       # some common function
     |
-    ├- .gitignore     # ignore data/
-    |
+    ├- .gitignore
     ├- config.yaml  # 全域設定使用到套件
     ├- init.sh      # 下載必要套件
     |
