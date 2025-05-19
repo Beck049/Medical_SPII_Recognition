@@ -1,7 +1,24 @@
 import os
 from .audio import get_wav_file
+"""
+This file is used to modify the data format
+- ASR_input
+"""
 
 def ASR_input(id, sentence):
+  """
+  Dict Layout:
+  {
+    "audio": {
+      "array": audio_array,
+      "file_id": file_id,
+      "sampling_rate": sampling_rate,
+      "duration": duration
+    },
+    "ans_id": id,
+    "sentence": sentence
+  }
+  """
   audio = get_wav_file(f"{id}.wav", 0)['audio']
   return {
     "audio": audio,

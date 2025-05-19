@@ -2,6 +2,12 @@ import librosa
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+"""
+This file is used to get the wav file
+- get_audio_name_sorted(): get a list of sorted wav files
+- get_wav_file(): get the wav file
+- draw_wavform(): draw the waveform
+"""
 
 # Get the absolute path to the project root
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -19,6 +25,21 @@ def get_audio_name_sorted():
     # sort
     wav_files_sorted = sorted(wav_files, key=extract_number)
     return wav_files_sorted
+
+# get a list of sorted wav files
+def get_valid_audio_name_sorted():
+    folder_path = os.path.join(PROJECT_ROOT, 'data', 'TRAINING_DATASET_1_PHASE', 'Validation_Dataset', 'audio')
+    
+    #  get all .wav
+    wav_files = [f for f in os.listdir(folder_path) if f.endswith('.wav')]
+    
+    def extract_number(filename):
+        return int(filename.split('.')[0])
+    
+    # sort
+    wav_files_sorted = sorted(wav_files, key=extract_number)
+    return wav_files_sorted
+
 
 # draw waveform
 def draw_wavform(wav_file_name, audio_array, sr):
