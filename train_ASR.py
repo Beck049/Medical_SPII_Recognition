@@ -159,7 +159,15 @@ def prepare_training(answer_file, max_samples=100, output_dir="models/whisper_fi
         output_dir: Directory to save models
     """
     print("Loading base model...")
-    model = whisper.load_model("medium", device="cpu", download_root="models")
+    model_path = os.path.join("models", "medium.pt")
+    if os.path.exists(model_path):
+        print(f"Using local model file: {model_path}")
+        model = whisper.load_model("medium", download_root="models", in_memory=False)
+    else:
+        print("Local model file not found. Please download the model file manually:")
+        print("https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt")
+        print(f"And place it in: {model_path}")
+        raise FileNotFoundError("Model file not found")
     
     print("Loading training data...")
     dataset = load_training_data(answer_file, max_samples=max_samples)
@@ -179,12 +187,6 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
                 eval_interval=10, patience=3, weight_decay=0.01, dropout_rate=0.1):
     """
     Train model for specified number of epochs
-    Args:
-        start_epoch: Starting epoch number (for resuming training)
-        num_epochs: Number of epochs to train
-    Returns:
-        model: Trained model
-        best_model_path: Path to best model checkpoint
     """
     # Set up training device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -225,22 +227,23 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
     
     # Whisper parameters
     SAMPLE_RATE = 16000
-    max_sample_length = 30 * SAMPLE_RATE
-    tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual)
+    max_sample_length = 30 * SAMPLE_RATE  # 30 seconds at 16kHz
     
     for epoch in range(start_epoch, start_epoch + num_epochs):
         model.train()
         total_loss = 0
+        processed_batches = 0
         
         for batch_idx, sample in enumerate(train_dataset):
             try:
-                # Prepare input audio with augmentation
+                # Get audio array and ensure it's the right shape
                 audio_array = sample['audio']['array']
-                if random.random() < 0.5:  # 50% chance to apply augmentation
-                    audio_array = apply_audio_augmentation(
-                        audio_array, 
-                        sample['audio']['sampling_rate']
-                    )
+                if not isinstance(audio_array, np.ndarray):
+                    print(f"Warning: audio_array is not numpy array, type: {type(audio_array)}")
+                    continue
+                
+                # Print audio shape for debugging
+                print(f"Original audio shape: {audio_array.shape}")
                 
                 # Resample if necessary
                 if sample['audio']['sampling_rate'] != SAMPLE_RATE:
@@ -250,33 +253,29 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
                         target_sr=SAMPLE_RATE
                     )
                 
+                # Convert to tensor and ensure correct shape
                 audio_tensor = torch.from_numpy(audio_array).float()
+                if len(audio_tensor.shape) > 1:
+                    audio_tensor = audio_tensor.mean(dim=-1)  # Convert stereo to mono if needed
                 
                 # Pad or trim the audio tensor
                 if audio_tensor.shape[0] > max_sample_length:
                     audio_tensor = audio_tensor[:max_sample_length]
                 elif audio_tensor.shape[0] < max_sample_length:
-                    audio_tensor = torch.nn.functional.pad(
-                        audio_tensor, 
-                        (0, max_sample_length - audio_tensor.shape[0])
-                    )
+                    padding = max_sample_length - audio_tensor.shape[0]
+                    audio_tensor = torch.nn.functional.pad(audio_tensor, (0, padding))
+                
+                print(f"Processed audio shape: {audio_tensor.shape}")
                 
                 # Convert to mel spectrogram
                 mel = whisper.log_mel_spectrogram(audio_tensor).to(device)
+                print(f"Mel spectrogram shape: {mel.shape}")
                 
-                # Get target text and detect language
+                # Get target text
                 target_text = sample["sentence"]
-                if model.is_multilingual:
-                    detect_audio = audio_tensor[:5 * SAMPLE_RATE]
-                    detect_mel = whisper.log_mel_spectrogram(detect_audio).to(device)
-                    result = model.detect_language(detect_mel)
-                    detected_lang = max(result, key=result.get)
-                    tokenizer = whisper.tokenizer.get_tokenizer(
-                        model.is_multilingual, 
-                        language=detected_lang
-                    )
                 
                 # Encode target text
+                tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual)
                 target_tokens = tokenizer.encode(target_text)
                 target_tokens = torch.tensor(target_tokens).unsqueeze(0).to(device)
                 
@@ -295,6 +294,7 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
                 )
                 
                 total_loss += loss.item()
+                processed_batches += 1
                 
                 # Backward pass
                 loss.backward()
@@ -307,42 +307,52 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
             
             except Exception as e:
                 print(f"Error processing batch {batch_idx}: {str(e)}")
+                print(f"Audio array type: {type(audio_array)}, shape: {audio_array.shape if hasattr(audio_array, 'shape') else 'no shape'}")
                 continue
         
-        # Calculate average training loss
-        avg_train_loss = total_loss / len(train_dataset)
-        print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, Average Training Loss: {avg_train_loss:.4f}")
+        if processed_batches > 0:
+            # Calculate average training loss
+            avg_train_loss = total_loss / processed_batches
+            print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, Average Training Loss: {avg_train_loss:.4f}")
+        else:
+            print("No batches were successfully processed in this epoch")
+            continue
         
         # Validation phase
         model.eval()
         with torch.no_grad():
-            val_ser_scores, avg_val_ser, _, _, _ = evaluate_model(model, val_dataset)
-            print(f"Validation SER: {avg_val_ser:.4f}")
-            
-            # Update learning rate
-            scheduler.step(avg_val_ser)
-            
-            # Save if better
-            if avg_val_ser < best_val_ser:
-                best_val_ser = avg_val_ser
-                patience_counter = 0
-                best_model_path = os.path.join(output_dir, f"whisper_best_ser_{avg_val_ser:.4f}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'loss': avg_train_loss,
-                    'val_ser': avg_val_ser,
-                }, best_model_path)
-            else:
-                patience_counter += 1
-                print(f"No improvement for {patience_counter} epochs")
-            
-            # Early stopping
-            if patience_counter >= patience:
-                print(f"Early stopping triggered after {epoch + 1} epochs")
-                break
+            try:
+                val_ser_scores, avg_val_ser, _, _, _ = evaluate_model(model, val_dataset)
+                print(f"Validation SER: {avg_val_ser:.4f}")
+                
+                # Update learning rate
+                scheduler.step(avg_val_ser)
+                
+                # Save if better
+                if avg_val_ser < best_val_ser:
+                    best_val_ser = avg_val_ser
+                    patience_counter = 0
+                    best_model_path = os.path.join(output_dir, f"whisper_best_ser_{avg_val_ser:.4f}.pt")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_train_loss,
+                        'val_ser': avg_val_ser,
+                    }, best_model_path)
+                else:
+                    patience_counter += 1
+                    print(f"No improvement for {patience_counter} epochs")
+                
+                # Early stopping
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered after {epoch + 1} epochs")
+                    break
+                
+            except Exception as e:
+                print(f"Error during validation: {str(e)}")
+                continue
         
         # Save checkpoint
         checkpoint_path = os.path.join(output_dir, f"whisper_epoch_{epoch + 1}.pt")
@@ -352,7 +362,7 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': avg_train_loss,
-            'val_ser': avg_val_ser,
+            'val_ser': avg_val_ser if 'avg_val_ser' in locals() else float('inf'),
         }, checkpoint_path)
     
     return model, best_model_path
