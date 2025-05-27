@@ -40,7 +40,7 @@ def load_training_data(answer_file, max_samples=None):
         List of ASR_input objects (checkout /utils/dataset.py/ASR_input)
     """
     data = []
-    with open(answer_file, 'r') as f:
+    with open(answer_file, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
             if max_samples is not None and i >= max_samples:
                 break
@@ -207,7 +207,7 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
     
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode='min', factor=0.5, patience=2
     )
     
     # Load checkpoint if exists
@@ -427,7 +427,8 @@ def main():
     elif args.stage == 'train':
         # Load model and datasets
         model = whisper.load_model("medium", device="cpu", download_root="models")
-        datasets = torch.load(os.path.join(args.output_dir, 'datasets.pt'))
+        # weights_only=False is important for loading the datasets on windows
+        datasets = torch.load(os.path.join(args.output_dir, 'datasets.pt'), weights_only=False)
         train_dataset = datasets['train_dataset']
         val_dataset = datasets['val_dataset']
         
