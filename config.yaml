@@ -1,0 +1,13 @@
+system_packages:
+  - python3
+  - git
+  - ffmpeg
+  - wget
+
+python_packages:
+  - librosa
+  - numpy
+  - matplotlib
+  - openai-whisper
+  - transformers 
+  - jiwer
