@@ -1,5 +1,8 @@
 # Ignore everything inside data/
 data/*
+models/*
+fine-tuning-whisper/*
 
 # But keep the folder itself (you can create a .gitkeep file)
 !data/.gitkeep
+!models/.gitkeep

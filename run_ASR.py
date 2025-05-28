@@ -6,6 +6,7 @@ import argparse
 import os
 import torch
 import glob
+import json
 
 def load_model(use_finetuned=False):
     """
@@ -42,50 +43,76 @@ def transcribe_audio(model, audio_path):
         model: Whisper model
         audio_path: Path to audio file
     Returns:
-        Transcribed text
+        dict containing transcribed text and timestamps
     """
     # Load and resample audio
     audio_array, sr = librosa.load(audio_path, sr=16000)
     
-    # Transcribe
+    # Transcribe with word timestamps
     result = model.transcribe(audio_array, word_timestamps=True, verbose=False)
-    return result["text"].strip()
+    
+    # Extract segments with timestamps
+    segments = []
+    for segment in result["segments"]:
+        for word in segment["words"]:
+            segments.append({
+                "word": word["word"],
+                "start": word["start"],
+                "end": word["end"]
+            })
+    
+    return {
+        "text": result["text"].strip(),
+        "segments": segments
+    }
 
 def main():
     parser = argparse.ArgumentParser(description='Run ASR on validation dataset')
     parser.add_argument('--use_finetuned', action='store_true',
                       help='Use finetuned model instead of pretrained')
+    parser.add_argument('--data_dir', type=str, default='data/TRAINING_DATASET_1_PHASE/Training_Dataset_02',
+                      help='Directory containing audio files')
     args = parser.parse_args()
 
     # Load model
     model = load_model(args.use_finetuned)
 
-    # Get validation audio files
-    validation_dir = "data/TRAINING_DATASET_1_PHASE/Validation_Dataset/audio"
-    if not os.path.exists(validation_dir):
-        raise FileNotFoundError(f"Validation directory not found: {validation_dir}")
+    # Get audio files
+    audio_dir = os.path.join(args.data_dir, "audio")
+    if not os.path.exists(audio_dir):
+        raise FileNotFoundError(f"Audio directory not found: {audio_dir}")
     
     audio_files = get_valid_audio_name_sorted()
     if not audio_files:
-        raise FileNotFoundError(f"No WAV files found in {validation_dir}")
+        raise FileNotFoundError(f"No WAV files found in {audio_dir}")
 
     # Create output directory if it doesn't exist
     output_dir = "outputs/ASR"
     os.makedirs(output_dir, exist_ok=True)
 
     # Process each audio file
-    print("\nProcessing validation audio files...")
-    output_file = os.path.join(output_dir, "validation_predictions.txt")
+    print("\nProcessing audio files...")
+    output_file = os.path.join(output_dir, "predictions.txt")
+    timestamps_file = os.path.join(args.data_dir, "task1_answer_timestamps.json")
+    
+    # Dictionary to store timestamps for each file
+    timestamps_dict = {}
     
     with open(output_file, 'w', encoding='utf-8') as f:
         for audio_file in audio_files:
             audio_id = os.path.splitext(audio_file)[0]  # Get filename without extension
-            audio_path = os.path.join(validation_dir, audio_file)
+            audio_path = os.path.join(audio_dir, audio_file)
             
             print(f"Processing {audio_file}...")
             try:
-                # Transcribe audio
-                transcribed_text = transcribe_audio(model, audio_path)
+                # Transcribe audio with timestamps
+                result = transcribe_audio(model, audio_path)
+                transcribed_text = result["text"]
+                
+                # Store timestamps
+                timestamps_dict[audio_id] = {
+                    "segments": result["segments"]
+                }
                 
                 # Write to file in format: id\ttext
                 f.write(f"{audio_id}\t{transcribed_text}\n")
@@ -95,7 +122,12 @@ def main():
                 print(f"Error processing {audio_file}: {str(e)}")
                 continue
 
+    # Save timestamps to JSON file
+    with open(timestamps_file, 'w', encoding='utf-8') as f:
+        json.dump(timestamps_dict, f, ensure_ascii=False, indent=2)
+
     print(f"\nTranscription complete. Results saved to {output_file}")
+    print(f"Timestamps saved to {timestamps_file}")
 
 if __name__ == "__main__":
     main()

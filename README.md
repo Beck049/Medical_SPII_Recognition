@@ -67,6 +67,43 @@ Medical_SPII_Recognition/
 {id} '\t' {sentence} '\n' 
 ```
 
-## Workflow
-1. Run `DownloadColab.py` to sync the Python notebook
-2. Check if the change is correct, then `git push`
+### NER finetune input
+```python
+{
+  "10": [
+    {'phi': "ID_NUMBER",
+     'start_time': "2.533",
+     'end_time': "3.154",
+     'entity': "09F016547J"},
+    {'phi': "ID_NUMBER",
+     'start_time': "7.632",
+     'end_time': "8.124",
+     'entity': "09F016547J"},
+  ],
+  "13": [
+    {'phi': "NULL"}
+  ],
+}
+```
+|SHI 類別|類別定義|競賽提供的資料中的類別名稱|
+|---|---|---|
+|姓名|病患名 / 醫師名 / 使用者名稱 / 家屬姓名 / 個人姓名|PATIENT / DOCTOR / USERNAME / FAMILYNAME / PERSONALNAME|
+|職業|無|PROFESSION|
+|地點|診間號 / 部門 / 醫院 / 組織 / 街 / 城市 / 區 / 郡 / 州 / 國家 / 區號 / 其他|ROOM / DEPARTMENT / HOSPITAL / ORGANIZATION / STREET / CITY / DISTRICT / COUNTY / STATE / COUNTRY / ZIP / LOCATION-OTHER|
+|年齡|無|AGE|
+|日期|日期 / 時間 / 週期 / 頻率|DATE / TIME / DURATION / SET|
+|聯絡方式|手機號碼 / 傳真 / 電子郵件信箱 / 網址 / 網際網路協定位址|PHONE / FAX / EMAIL / URL / IPADDRESS|
+|識別符|社群安全碼 / 醫療紀錄號碼 / 健康計畫號碼 / 帳戶 / 證照號碼 / 車牌 / 裝置號碼 / 生物識別碼 / 識別碼|SOCIAL_SECURITY_NUMBER / MEDICAL_RECORD_NUMBER / HEALTH_PLAN_NUMBER / ACCOUNT_NUMBER / LICENSE_NUMBER / VEHICLE_ID / DEVICE_ID / BIOMETRIC_ID / ID_NUMBER|
+
+### NER output
+|File ID|SHI Type|Start Offset|End Offset|Text (Optional)|
+|---|---|---|---|---|
+|file01|AGE|1.523|1.826|57|
+|file01|PATIENT|1.923|2.120|Ken Moll|
+|file01|IDNUM|4.85|5.401|62S021442H|
+|file01|STREET|5.52|5.865|Yale|
+|file01|CITY|6.451|6.732|Andergrove|
+|file01|STATE|6.735|6.957|Tasmania|
+|file01|ZIP|11.167|11.984|2042|
+|file01|MEDICALRECORD|12.491|13.644|6270214.MFH|
+|file01|IDNUM|14.464|15.782|62S02144|

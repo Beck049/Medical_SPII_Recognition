@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 import random
 import argparse
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler  # Add mixed precision training
 
 """
 python train_ASR.py --stage prepare --max_samples 100
@@ -29,6 +31,9 @@ python train_ASR.py --stage train --start_epoch 9 --num_epochs 1
 python train_ASR.py --stage evaluate --max_samples 20
 """
 
+# Set PyTorch memory allocator configuration
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+
 def load_training_data(answer_file, max_samples=None):
     """
     Useage:
@@ -40,6 +45,10 @@ def load_training_data(answer_file, max_samples=None):
         List of ASR_input objects (checkout /utils/dataset.py/ASR_input)
     """
     data = []
+    SAMPLE_RATE = 16000
+    max_sample_length = 30 * SAMPLE_RATE  # 30 seconds at 16kHz
+    print(f"Target audio length: {max_sample_length} samples ({max_sample_length/SAMPLE_RATE:.1f} seconds at {SAMPLE_RATE}Hz)")
+    
     with open(answer_file, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
             if max_samples is not None and i >= max_samples:
@@ -52,10 +61,60 @@ def load_training_data(answer_file, max_samples=None):
                         sentence = id_text[1]
                         sample = ASR_input(audio_id, sentence)
                         if sample is not None:
-                            data.append(sample)
+                            # Create a new dictionary for the sample to ensure immutability
+                            processed_sample = {
+                                'ans_id': sample['ans_id'],
+                                'sentence': sample['sentence'],
+                                'audio': {
+                                    'array': None,  # Will be set to the padded array
+                                    'sampling_rate': SAMPLE_RATE
+                                }
+                            }
+                            
+                            # Process and pad/truncate the audio array
+                            audio_array = sample['audio']['array'].copy()  # Create a copy to avoid modifying original
+                            original_length = len(audio_array)
+                            
+                            if sample['audio']['sampling_rate'] != SAMPLE_RATE:
+                                print(f"Resampling audio {audio_id} from {sample['audio']['sampling_rate']}Hz to {SAMPLE_RATE}Hz")
+                                audio_array = librosa.resample(audio_array, 
+                                                             orig_sr=sample['audio']['sampling_rate'], 
+                                                             target_sr=SAMPLE_RATE)
+                            
+                            # Pad or truncate to fixed length
+                            if len(audio_array) > max_sample_length:
+                                print(f"Truncating audio {audio_id} from {len(audio_array)} to {max_sample_length} samples")
+                                audio_array = audio_array[:max_sample_length]
+                            elif len(audio_array) < max_sample_length:
+                                print(f"Padding audio {audio_id} from {len(audio_array)} to {max_sample_length} samples")
+                                audio_array = np.pad(audio_array, 
+                                                   (0, max_sample_length - len(audio_array)), 
+                                                   mode='constant')
+                            
+                            # Verify the length is correct
+                            if len(audio_array) != max_sample_length:
+                                raise ValueError(f"Audio {audio_id} has incorrect length after processing: {len(audio_array)} != {max_sample_length}")
+                            
+                            # Store the processed array as a numpy array to ensure immutability
+                            processed_sample['audio']['array'] = np.array(audio_array, dtype=np.float32)
+                            
+                            # Verify the array is immutable and has correct length
+                            if len(processed_sample['audio']['array']) != max_sample_length:
+                                raise ValueError(f"Audio {audio_id} has incorrect length after conversion to numpy array: {len(processed_sample['audio']['array'])} != {max_sample_length}")
+                            
+                            data.append(processed_sample)
+                            print(f"Successfully processed audio {audio_id}: {original_length} -> {len(processed_sample['audio']['array'])} samples")
+                            
                     except Exception as e:
-                        print(f"Error processing line {i+1}: {str(e)}")
+                        print(f"Error processing line {i+1} (audio_id {audio_id if 'audio_id' in locals() else 'unknown'}): {str(e)}")
                         continue
+    
+    # Final verification of all samples
+    for i, sample in enumerate(data):
+        if len(sample['audio']['array']) != max_sample_length:
+            raise ValueError(f"Sample {i} (audio_id {sample['ans_id']}) has incorrect length: {len(sample['audio']['array'])} != {max_sample_length}")
+    
+    print(f"\nSuccessfully processed {len(data)} samples, all with length {max_sample_length}")
     return data
 
 def tokenize_text(text):
@@ -169,9 +228,9 @@ def prepare_training(answer_file, max_samples=100, output_dir="models/whisper_fi
         print(f"And place it in: {model_path}")
         raise FileNotFoundError("Model file not found")
     
-    print("Loading training data...")
+    print("Loading training data (with audio padded/truncated to 30 seconds at 16kHz)...")
     dataset = load_training_data(answer_file, max_samples=max_samples)
-    print(f"Created dataset with {len(dataset)} samples")
+    print(f"Created dataset with {len(dataset)} samples, each audio array has shape {dataset[0]['audio']['array'].shape}")
     
     # Split dataset
     train_dataset, val_dataset = train_test_split(dataset, test_size=0.2, random_state=42)
@@ -182,15 +241,43 @@ def prepare_training(answer_file, max_samples=100, output_dir="models/whisper_fi
     
     return model, train_dataset, val_dataset, output_dir
 
+def clear_cuda_memory():
+    """
+    Manually clear CUDA memory
+    """
+    if torch.cuda.is_available():
+        print("Clearing CUDA memory...")
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
+        # Reset peak memory stats
+        torch.cuda.reset_peak_memory_stats()
+        # Get current memory usage
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        print(f"CUDA memory after clearing - Allocated: {allocated:.2f}MB, Reserved: {reserved:.2f}MB")
+
 def train_epochs(model, train_dataset, val_dataset, output_dir, 
-                start_epoch=0, num_epochs=10, learning_rate=5e-6,
-                eval_interval=10, patience=3, weight_decay=0.01, dropout_rate=0.1):
+                start_epoch=0, num_epochs=10, learning_rate=5e-6, batch_size=2,  # Reduced batch size
+                eval_interval=10, patience=3, weight_decay=0.01, dropout_rate=0.1,
+                gradient_accumulation_steps=8):  # Increased gradient accumulation steps
     """
     Train model for specified number of epochs
     """
+    # Clear CUDA memory before starting training
+    clear_cuda_memory()
+    
     # Set up training device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler()
+    
+    # Print initial memory usage
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        print(f"Initial CUDA memory after model load - Allocated: {allocated:.2f}MB, Reserved: {reserved:.2f}MB")
     
     # Enable dropout during training
     model.train()
@@ -219,96 +306,121 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
     
     # Training loop
     best_val_ser = float('inf')
     best_model_path = None
     patience_counter = 0
     
-    # Whisper parameters
-    SAMPLE_RATE = 16000
-    max_sample_length = 30 * SAMPLE_RATE  # 30 seconds at 16kHz
+    # Create DataLoader with custom collate function and disabled pin_memory
+    def custom_collate_fn(batch):
+        """
+        Custom collate function to ensure all audio arrays have the same length
+        """
+        # Verify all arrays have the same length
+        expected_length = len(batch[0]['audio']['array'])
+        for i, sample in enumerate(batch):
+            if len(sample['audio']['array']) != expected_length:
+                raise ValueError(f"Sample {i} has incorrect length: {len(sample['audio']['array'])} != {expected_length}")
+        
+        # Convert audio arrays to tensors and stack them
+        audio_arrays = torch.stack([torch.from_numpy(sample['audio']['array']) for sample in batch])
+        sentences = [sample['sentence'] for sample in batch]
+        ans_ids = [sample['ans_id'] for sample in batch]
+        
+        return {
+            'audio': {'array': audio_arrays, 'sampling_rate': batch[0]['audio']['sampling_rate']},
+            'sentence': sentences,
+            'ans_id': ans_ids
+        }
+    
+    train_dataloader = DataLoader(train_dataset, 
+                                batch_size=batch_size, 
+                                shuffle=True, 
+                                collate_fn=custom_collate_fn,
+                                pin_memory=False)
     
     for epoch in range(start_epoch, start_epoch + num_epochs):
         model.train()
         total_loss = 0
         processed_batches = 0
+        optimizer.zero_grad()
         
-        for batch_idx, sample in enumerate(train_dataset):
+        for batch_idx, batch in enumerate(train_dataloader):
             try:
-                # Get audio array and ensure it's the right shape
-                audio_array = sample['audio']['array']
-                if not isinstance(audio_array, np.ndarray):
-                    print(f"Warning: audio_array is not numpy array, type: {type(audio_array)}")
-                    continue
+                # Move batch to device
+                audio_arrays = batch['audio']['array'].to(device)
+                target_texts = batch['sentence']
                 
-                # Print audio shape for debugging
-                print(f"Original audio shape: {audio_array.shape}")
+                batch_loss = 0.0
+                for i, (audio_array, target_text) in enumerate(zip(audio_arrays, target_texts)):
+                    # Use mixed precision training
+                    with autocast():
+                        # Generate mel spectrogram
+                        mel = whisper.log_mel_spectrogram(audio_array).to(device)
+                        
+                        # Tokenize target text
+                        tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual)
+                        target_tokens = tokenizer.encode(target_text)
+                        target_tokens = torch.tensor(target_tokens).unsqueeze(0).to(device)
+                        
+                        # Forward pass
+                        logits = model(mel.unsqueeze(0), target_tokens)
+                        decoder_input = target_tokens[:, :-1]
+                        target_tokens_shifted = target_tokens[:, 1:]
+                        logits = logits[:, :decoder_input.shape[1], :]
+                        
+                        # Calculate loss
+                        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), 
+                                             target_tokens_shifted.reshape(-1), 
+                                             ignore_index=-100)
+                        # Scale loss by gradient accumulation steps
+                        loss = loss / gradient_accumulation_steps
+                    
+                    # Scale loss and backpropagate
+                    scaler.scale(loss).backward()
+                    batch_loss += loss.item() * gradient_accumulation_steps
                 
-                # Resample if necessary
-                if sample['audio']['sampling_rate'] != SAMPLE_RATE:
-                    audio_array = librosa.resample(
-                        audio_array,
-                        orig_sr=sample['audio']['sampling_rate'],
-                        target_sr=SAMPLE_RATE
-                    )
-                
-                # Convert to tensor and ensure correct shape
-                audio_tensor = torch.from_numpy(audio_array).float()
-                if len(audio_tensor.shape) > 1:
-                    audio_tensor = audio_tensor.mean(dim=-1)  # Convert stereo to mono if needed
-                
-                # Pad or trim the audio tensor
-                if audio_tensor.shape[0] > max_sample_length:
-                    audio_tensor = audio_tensor[:max_sample_length]
-                elif audio_tensor.shape[0] < max_sample_length:
-                    padding = max_sample_length - audio_tensor.shape[0]
-                    audio_tensor = torch.nn.functional.pad(audio_tensor, (0, padding))
-                
-                print(f"Processed audio shape: {audio_tensor.shape}")
-                
-                # Convert to mel spectrogram
-                mel = whisper.log_mel_spectrogram(audio_tensor).to(device)
-                print(f"Mel spectrogram shape: {mel.shape}")
-                
-                # Get target text
-                target_text = sample["sentence"]
-                
-                # Encode target text
-                tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual)
-                target_tokens = tokenizer.encode(target_text)
-                target_tokens = torch.tensor(target_tokens).unsqueeze(0).to(device)
-                
-                # Forward pass
-                logits = model(mel.unsqueeze(0), target_tokens)
-                
-                # Calculate loss
-                decoder_input = target_tokens[:, :-1]
-                target_tokens_shifted = target_tokens[:, 1:]
-                logits = logits[:, :decoder_input.shape[1], :]
-                
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    target_tokens_shifted.reshape(-1),
-                    ignore_index=-100
-                )
-                
-                total_loss += loss.item()
+                # Average loss over batch
+                batch_loss /= len(batch['sentence'])
+                total_loss += batch_loss
                 processed_batches += 1
                 
-                # Backward pass
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+                # Update weights if we've accumulated enough gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    # Unscale gradients before optimization
+                    scaler.unscale_(optimizer)
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Update weights
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    
+                    # Clear CUDA cache
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
-                # Evaluate periodically
                 if (batch_idx + 1) % eval_interval == 0:
-                    print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, Batch {batch_idx + 1}, Loss: {loss.item():.4f}")
+                    print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, "
+                          f"Batch {batch_idx + 1}, Loss: {batch_loss:.4f}")
             
             except Exception as e:
                 print(f"Error processing batch {batch_idx}: {str(e)}")
-                print(f"Audio array type: {type(audio_array)}, shape: {audio_array.shape if hasattr(audio_array, 'shape') else 'no shape'}")
+                # Clear CUDA cache on error
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
+        
+        # Make sure to update weights at the end of epoch if needed
+        if (batch_idx + 1) % gradient_accumulation_steps != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         if processed_batches > 0:
             # Calculate average training loss
@@ -318,52 +430,21 @@ def train_epochs(model, train_dataset, val_dataset, output_dir,
             print("No batches were successfully processed in this epoch")
             continue
         
-        # Validation phase
-        model.eval()
-        with torch.no_grad():
-            try:
-                val_ser_scores, avg_val_ser, _, _, _ = evaluate_model(model, val_dataset)
-                print(f"Validation SER: {avg_val_ser:.4f}")
-                
-                # Update learning rate
-                scheduler.step(avg_val_ser)
-                
-                # Save if better
-                if avg_val_ser < best_val_ser:
-                    best_val_ser = avg_val_ser
-                    patience_counter = 0
-                    best_model_path = os.path.join(output_dir, f"whisper_best_ser_{avg_val_ser:.4f}.pt")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': avg_train_loss,
-                        'val_ser': avg_val_ser,
-                    }, best_model_path)
-                else:
-                    patience_counter += 1
-                    print(f"No improvement for {patience_counter} epochs")
-                
-                # Early stopping
-                if patience_counter >= patience:
-                    print(f"Early stopping triggered after {epoch + 1} epochs")
-                    break
-                
-            except Exception as e:
-                print(f"Error during validation: {str(e)}")
-                continue
-        
-        # Save checkpoint
+        # Save checkpoint with scaler state
         checkpoint_path = os.path.join(output_dir, f"whisper_epoch_{epoch + 1}.pt")
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'loss': avg_train_loss,
             'val_ser': avg_val_ser if 'avg_val_ser' in locals() else float('inf'),
         }, checkpoint_path)
+        
+        # Clear CUDA cache after each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     return model, best_model_path
 
@@ -408,11 +489,21 @@ def main():
                       help='Maximum number of samples to use')
     parser.add_argument('--output_dir', type=str, default='models/whisper_finetuned',
                       help='Directory to save models')
+    parser.add_argument('--clear_memory', action='store_true',
+                      help='Clear CUDA memory before training')
     args = parser.parse_args()
+    
+    # Clear CUDA memory if requested
+    if args.clear_memory and torch.cuda.is_available():
+        clear_cuda_memory()
     
     answer_file = "data/TRAINING_DATASET_1_PHASE/Training_Dataset_01/task1_answer.txt"
     
     if args.stage == 'prepare':
+        # Clear memory before preparing data
+        if torch.cuda.is_available():
+            clear_cuda_memory()
+            
         model, train_dataset, val_dataset, output_dir = prepare_training(
             answer_file, 
             max_samples=args.max_samples,
@@ -425,6 +516,10 @@ def main():
         }, os.path.join(output_dir, 'datasets.pt'))
         
     elif args.stage == 'train':
+        # Clear memory before loading model and datasets
+        if torch.cuda.is_available():
+            clear_cuda_memory()
+            
         # Load model and datasets
         model = whisper.load_model("medium", device="cpu", download_root="models")
         # weights_only=False is important for loading the datasets on windows
@@ -436,10 +531,15 @@ def main():
         model, best_model_path = train_epochs(
             model, train_dataset, val_dataset, args.output_dir,
             start_epoch=args.start_epoch,
-            num_epochs=args.num_epochs
+            num_epochs=args.num_epochs,
+            batch_size=2
         )
         
     elif args.stage == 'evaluate':
+        # Clear memory before evaluation
+        if torch.cuda.is_available():
+            clear_cuda_memory()
+            
         # Load best model
         model = whisper.load_model("medium", device="cpu", download_root="models")
         best_model_path = os.path.join(args.output_dir, "whisper_best_ser_*.pt")
