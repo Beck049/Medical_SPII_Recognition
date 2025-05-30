@@ -121,13 +121,3 @@ trainer.train()
 # 儲存 model
 trainer.save_model(save_model_path)      
 tokenizer.save_pretrained(save_model_path) 
-
-# # 預測測試 1 筆資料
-# # 用 stanza.MultilingualPipeline() 做句子斷詞
-# nlp = stanza.MultilingualPipeline()
-# test_sen = "Yeah, I imagine it would — sorry, go ahead. So it's supposed to work immediately, right? Yep. So we'll see if I'm productive tomorrow. I hope I'm productive today. I've actually been trying to plan. If I do the titles today, then I can do my laundry tomorrow. Right. I probably could bring my computer and do titles while I'm doing my laundry. If I was — but I won't do that."
-# # test_sen = "It makes it really hard when I lose things. Even this morning, he knocked over my glasses. I had them on the dresser and he was trying to find them this morning because I can't see anything without my glasses. He was like, "Are you sure you didn't put them somewhere else?" and I'm like, "Yes, I put them in one of two places. They are in neither. I heard you knock them over last night when you came back and the lights were off." He got annoyed that I was blaming him and I got annoyed that he got annoyed for me blaming him when it was his fault. He eventually found them obviously because I'm wearing them but that was a stressful way to wake up."
-# doc = nlp(test_sen)
-# test_sen_tokens = [word.text for sent in doc.sentences for word in sent.words]
-# print(predict(test_sen_tokens))
-
